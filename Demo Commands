@@ -1,0 +1,116 @@
+Demo 1 - RDDs, Data Frames, and SQL
+===================================
+case class Movie(movieId: Int, title: String, genres: Seq[String])
+case class User(userId: Int, gender: String, age: Int, occupation: Int, zip: String)
+
+def parseMovie(str: String): Movie = {
+      val fields = str.split("::")
+      assert(fields.size == 3)
+      Movie(fields(0).toInt, fields(1).toString, Seq(fields(2)))
+ }
+
+def parseUser(str: String): User = {
+      val fields = str.split("::")
+      assert(fields.size == 5)
+      User(fields(0).toInt, fields(1).toString, fields(2).toInt, fields(3).toInt, fields(4).toString)
+ }
+
+val moviesRDD = sc.textFile("movies.dat").map(parseMovie)
+val usersRDD = sc.textFile("users.dat").map(parseUser)
+
+val moviesDF = moviesRDD.toDF()
+val usersDF = usersRDD.toDF()
+
+moviesDF.printSchema()
+usersDF.printSchema()
+
+moviesDF.registerTempTable("movies")
+usersDF.registerTempTable("users")
+
+sqlContext.sql("SELECT * FROM movies").show()
+
+sqlContext.sql("SELECT age, sum(if(gender='M',user_count,0)) AS M, sum(if(gender='F',user_count,0)) AS F FROM (SELECT age, gender, count(*) AS user_count FROM users GROUP BY age, gender) AS ud GROUP BY age ORDER BY age").show()
+
+Demo 2 - Under The Hood With MLlib ALS
+======================================
+import org.apache.spark.mllib.recommendation.{ALS, MatrixFactorizationModel, Rating}
+
+def parseRating(str: String): Rating = {
+      val fields = str.split("::")
+      Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
+ }
+
+val ratingsRDD = sc.textFile("ratings.dat").map(parseRating).cache()
+val ratingsDF = ratingsRDD.toDF
+ratingsDF.registerTempTable("ratings")
+
+Examine
+————————
+println("Total number of ratings: " + ratingsRDD.count() + "\nTotal number of movies rated: " + ratingsRDD.map(_.product).distinct().count() + "\nTotal number of users who rated movies: " + ratingsRDD.map(_.user).distinct().count())
+
+ratingsDF.printSchema()
+
+// What are the highest rated movies?
+sqlContext.sql("SELECT movies.title, ratings.avgRating, ratings. ratingsCount FROM (SELECT product AS movieId, avg(rating) AS avgRating, count(rating) AS ratingsCount FROM ratings GROUP BY product HAVING ratingsCount > 4 ORDER BY avgRating DESC LIMIT 20) AS ratings INNER JOIN movies ON movies.movieId = ratings.movieId ORDER BY ratings.avgRating DESC").show()
+
+Continue
+————————
+import org.apache.spark.rdd._
+def computeRmse(model: MatrixFactorizationModel, data: RDD[Rating], n: Long): Double = {
+    val predictions: RDD[Rating] = model.predict(data.map(x => (x.user, x.product)))
+    val predictionsAndRatings = predictions.map(x => ((x.user, x.product), x.rating))
+    .join(data.map(x => ((x.user, x.product), x.rating))).values
+    math.sqrt(predictionsAndRatings.map(x => (x._1 - x._2) * (x._1 - x._2)).reduce(_ + _) / n)
+}
+
+val splitsRDD = ratingsRDD.randomSplit(Array(0.6, 0.2, 0.2), 0L)
+val trainingRDD = splitsRDD(0).cache()
+val validationRDD = splitsRDD(1).cache()
+val testRDD = splitsRDD(2).cache()
+val numTraining = trainingRDD.count()
+val numValidation = validationRDD.count()
+val numTest = testRDD.count()
+println(s"Training ratings: $numTraining \nValidation ratings: $numValidation \nTest ratings: $numTest")
+
+val ranks = List(5, 10, 15)
+val iters = List(10, 20)
+val lambdas = List(0.1, 1.0)
+var bestModel: Option[MatrixFactorizationModel] = None
+var bestRmse = Double.MaxValue
+var bestRank = 0
+var bestIter = -1
+var bestLambda = -1.0
+for (rank <- ranks; iter <- iters; lambda <- lambdas) {
+   val model = ALS.train(trainingRDD, rank, iter, lambda)
+   val validationRmse = computeRmse(model, validationRDD, numValidation)
+   println(s"RMSE = $validationRmse for the model trained with rank = $rank, lambda = $lambda, and iter = $iter.")
+   if (validationRmse < bestRmse) {
+      bestModel = Some(model)
+      bestRmse = validationRmse
+      bestRank = rank
+      bestLambda = lambda
+      bestIter = iter
+   }
+}
+println(s"Best model: rank = $bestRank, iter = $bestIter, and lambda = $bestLambda")
+
+val testRmse = computeRmse(bestModel.get, testRDD, numTest)
+println(s"Final score: $testRmse.")
+
+
+Demo 3 - Putting It All Together
+================================
+val options = Map("path" -> "/Users/Shared/Hive/movies")
+moviesDF.write.options(options).mode("overwrite").saveAsTable("movies")
+val options = Map("path" -> "/Users/Shared/Hive/users")
+usersDF.write.options(options).mode("overwrite").saveAsTable("users")
+val options = Map("path" -> "/Users/Shared/Hive/ratings")
+ratingsDF.write.options(options).mode("overwrite").saveAsTable("ratings")
+
+exit
+
+Start Thrift Server (for ODBC access by Tableau):
+/usr/local/Cellar/apache-spark/1.6.2/libexec/sbin/start-thriftserver.sh
+
+Stop Thrift Server:
+/usr/local/Cellar/apache-spark/1.6.2/libexec/sbin/stop-thriftserver.sh
